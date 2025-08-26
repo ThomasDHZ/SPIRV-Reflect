@@ -1,3 +1,4 @@
+
 /*
  Copyright 2017-2022 Google Inc.
 
@@ -19,6 +20,8 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <string.h>
+
+#include <cstdio>
 
 #if defined(WIN32)
 #define _CRTDBG_MAP_ALLOC
@@ -372,8 +375,10 @@ static SpvReflectResult ReadU32(SpvReflectPrvParser* p_parser, uint32_t word_off
   return result;
 }
 
-#define UNCHECKED_READU32(parser, word_offset, value) \
-  { (void)ReadU32(parser, word_offset, (uint32_t*)&(value)); }
+#define UNCHECKED_READU32(parser, word_offset, value)        \
+  {                                                          \
+    (void)ReadU32(parser, word_offset, (uint32_t*)&(value)); \
+  }
 
 #define CHECKED_READU32(parser, word_offset, value)                                              \
   {                                                                                              \
@@ -1418,6 +1423,78 @@ static bool UserTypeMatches(const char* user_type, const char* pattern) {
   return false;
 }
 
+static SpvReflectResult ParseSpecializationConstantValue(SpvReflectPrvParser* p_parser, SpvReflectPrvNode* p_node,
+                                                         uint32_t* p_literals, uint32_t* p_literal_count) {
+  if (p_literals == NULL) {
+    *p_literal_count = 0;
+  }
+
+  SpvReflectResult result = SPV_REFLECT_RESULT_SUCCESS;
+  switch (p_node->op) {
+    case SpvOpSpecConstantTrue: {
+      if (p_literals) {
+        p_literals[0] = 1;  // Represent true as 1 (bool has no width, but treat as uint32)
+      }
+      if (p_literals == NULL) *p_literal_count = 1;
+    } break;
+
+    case SpvOpSpecConstantFalse: {
+      if (p_literals) {
+        p_literals[0] = 0;  // Represent false as 0
+      }
+      if (p_literals == NULL) *p_literal_count = 1;
+    } break;
+
+    case SpvOpSpecConstant: {
+      uint32_t word_count = p_node->word_count - 3;  // Skip result-type, result-id
+      if (p_literals == NULL) {
+        *p_literal_count = word_count;
+      } else {
+        // Copy literal words directly
+        for (uint32_t i = 0; i < word_count; ++i) {
+          IF_READU32(result, p_parser, p_node->word_offset + 3 + i, p_literals[i]);
+          if (result != SPV_REFLECT_RESULT_SUCCESS) return result;
+        }
+      }
+    } break;
+
+    case SpvOpSpecConstantComposite: {
+      uint32_t total_literals = 0;
+      uint32_t offset = 0;
+      for (uint32_t i = 3; i < p_node->word_count; ++i) {  // Skip result-type, result-id
+        uint32_t constituent_id = 0;
+        IF_READU32(result, p_parser, p_node->word_offset + i, constituent_id);
+        if (result != SPV_REFLECT_RESULT_SUCCESS) return result;
+
+        SpvReflectPrvNode* p_constituent = FindNode(p_parser, constituent_id);
+        if (IsNull(p_constituent)) {
+          return SPV_REFLECT_RESULT_ERROR_SPIRV_INVALID_ID_REFERENCE;
+        }
+
+        uint32_t this_count = 0;
+        result = ParseSpecializationConstantValue(p_parser, p_constituent, NULL, &this_count);
+        if (result != SPV_REFLECT_RESULT_SUCCESS) return result;
+
+        total_literals += this_count;
+
+        if (p_literals) {
+          result = ParseSpecializationConstantValue(p_parser, p_constituent, p_literals + offset, &this_count);
+          if (result != SPV_REFLECT_RESULT_SUCCESS) return result;
+          offset += this_count;
+        }
+      }
+      if (p_literals == NULL) {
+        *p_literal_count = total_literals;
+      }
+    } break;
+
+      // default:
+      //   return SPV_REFLECT_RESULT_ERROR_SPIRV_UNEXPECTED_LITERAL;
+  }
+
+  return SPV_REFLECT_RESULT_SUCCESS;
+}
+
 static SpvReflectResult ParseDecorations(SpvReflectPrvParser* p_parser, SpvReflectShaderModule* p_module) {
   uint32_t spec_constant_count = 0;
   for (uint32_t i = 0; i < p_parser->node_count; ++i) {
@@ -1730,13 +1807,47 @@ static SpvReflectResult ParseDecorations(SpvReflectPrvParser* p_parser, SpvRefle
       uint32_t decoration = (uint32_t)INVALID_VALUE;
       CHECKED_READU32(p_parser, p_node->word_offset + 2, decoration);
       if (decoration == SpvDecorationSpecId) {
+        // Inside the loop where decoration == SpvDecorationSpecId:
         const uint32_t count = p_module->spec_constant_count;
         CHECKED_READU32(p_parser, p_node->word_offset + 1, p_module->spec_constants[count].spirv_id);
         CHECKED_READU32(p_parser, p_node->word_offset + 3, p_module->spec_constants[count].constant_id);
-        // If being used for a OpSpecConstantComposite (ex. LocalSizeId), there won't be a name
+
         SpvReflectPrvNode* target_node = FindNode(p_parser, p_module->spec_constants[count].spirv_id);
-        if (IsNotNull(target_node)) {
-          p_module->spec_constants[count].name = target_node->name;
+        if (IsNull(target_node)) {
+          fprintf(stderr, "Error: No node found for SPIR-V ID %u\n", p_module->spec_constants[count].spirv_id);
+          return SPV_REFLECT_RESULT_ERROR_SPIRV_INVALID_ID_REFERENCE;
+        }
+
+        p_module->spec_constants[count].name = target_node->name;
+
+        // Set type (from result_type_id)
+        p_module->spec_constants[count].type = FindType(p_module, target_node->result_type_id);
+        if (IsNull(p_module->spec_constants[count].type)) {
+          fprintf(stderr, "Error: No type found for result_type_id %u (SPIR-V ID %u, op %u)\n", target_node->result_type_id,
+                  p_module->spec_constants[count].spirv_id, target_node->op);
+        } else {
+          fprintf(stderr, "Debug: Found type for SPIR-V ID %u, type op %u\n", p_module->spec_constants[count].spirv_id,
+                  p_module->spec_constants[count].type->op);
+        }
+
+        // Parse default value if present (skip OpSpecConstantOp)
+        if (target_node->op != SpvOpSpecConstantOp) {
+          uint32_t literal_count = 0;
+          SpvReflectResult res = ParseSpecializationConstantValue(p_parser, target_node, NULL, &literal_count);
+          if (res == SPV_REFLECT_RESULT_SUCCESS && literal_count > 0) {
+            p_module->spec_constants[count].default_literals = (uint32_t*)calloc(literal_count, sizeof(uint32_t));
+            if (IsNull(p_module->spec_constants[count].default_literals)) {
+              return SPV_REFLECT_RESULT_ERROR_ALLOC_FAILED;
+            }
+            res = ParseSpecializationConstantValue(p_parser, target_node, p_module->spec_constants[count].default_literals,
+                                                   &literal_count);
+            if (res != SPV_REFLECT_RESULT_SUCCESS) {
+              SafeFree(p_module->spec_constants[count].default_literals);
+              return res;
+            }
+            p_module->spec_constants[count].default_literal_count = literal_count;
+            p_module->spec_constants[count].has_default_value = true;
+          }
         }
         p_module->spec_constant_count++;
       }
@@ -1794,6 +1905,7 @@ static SpvReflectResult ParseType(SpvReflectPrvParser* p_parser, SpvReflectPrvNo
       p_type->op = p_node->op;
       p_type->decoration_flags = 0;
     }
+
     // Top level types need to pick up decorations from all types below it.
     // Issue and fix here: https://github.com/chaoticbob/SPIRV-Reflect/issues/64
     p_type->decoration_flags = ApplyDecorations(&p_node->decorations);
@@ -4219,6 +4331,40 @@ static SpvReflectResult SynchronizeDescriptorSets(SpvReflectShaderModule* p_modu
   return result;
 }
 
+static SpvReflectResult ParseSpecializationConstantsDetails(SpvReflectPrvParser* p_parser, SpvReflectShaderModule* p_module) {
+  for (uint32_t i = 0; i < p_module->spec_constant_count; ++i) {
+    SpvReflectSpecializationConstant* constant = &p_module->spec_constants[i];
+    SpvReflectPrvNode* target_node = FindNode(p_parser, constant->spirv_id);
+    if (IsNull(target_node)) {
+      return SPV_REFLECT_RESULT_ERROR_SPIRV_INVALID_ID_REFERENCE;
+    }
+
+    // Set type (now safe after ParseTypes)
+    constant->type = FindType(p_module, target_node->result_type_id);
+
+    // Parse default value if present
+    constant->has_default_value = false;
+    if (target_node->op != SpvOpSpecConstantOp) {  // Skip ops with no static default
+      uint32_t literal_count = 0;
+      SpvReflectResult res = ParseSpecializationConstantValue(p_parser, target_node, NULL, &literal_count);
+      if (res == SPV_REFLECT_RESULT_SUCCESS && literal_count > 0) {
+        constant->default_literals = (uint32_t*)calloc(literal_count, sizeof(uint32_t));
+        if (IsNull(constant->default_literals)) {
+          return SPV_REFLECT_RESULT_ERROR_ALLOC_FAILED;
+        }
+        res = ParseSpecializationConstantValue(p_parser, target_node, constant->default_literals, &literal_count);
+        if (res != SPV_REFLECT_RESULT_SUCCESS) {
+          SafeFree(constant->default_literals);
+          return res;
+        }
+        constant->default_literal_count = literal_count;
+        constant->has_default_value = true;
+      }
+    }
+  }
+  return SPV_REFLECT_RESULT_SUCCESS;
+}
+
 static SpvReflectResult CreateShaderModule(uint32_t flags, size_t size, const void* p_code, SpvReflectShaderModule* p_module) {
   // Initialize all module fields to zero
   memset(p_module, 0, sizeof(*p_module));
@@ -4263,7 +4409,10 @@ static SpvReflectResult CreateShaderModule(uint32_t flags, size_t size, const vo
 
   // Create parser
   SpvReflectResult result = CreateParser(p_module->_internal->spirv_size, p_module->_internal->spirv_code, &parser);
-
+  if (result == SPV_REFLECT_RESULT_SUCCESS) {
+    result = ParseSpecializationConstantsDetails(&parser, p_module);
+    SPV_REFLECT_ASSERT(result == SPV_REFLECT_RESULT_SUCCESS);
+  }
   // Generator
   {
     const uint32_t* p_ptr = (const uint32_t*)p_module->_internal->spirv_code;

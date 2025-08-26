@@ -576,9 +576,13 @@ typedef struct SpvReflectCapability {
 
 */
 typedef struct SpvReflectSpecializationConstant {
-  uint32_t spirv_id;
-  uint32_t constant_id;
-  const char* name;
+  uint32_t                       spirv_id;
+  uint32_t                       constant_id;
+  const char*                    name;
+  SpvReflectTypeDescription*     type;                   // Pointer to the constant's type
+  bool                           has_default_value;      // True if a default value is present
+  uint32_t*                      default_literals;       // NEW: Flattened array of literal words (interpret via type)
+  uint32_t                       default_literal_count;  // NEW: Number of words in default_literals
 } SpvReflectSpecializationConstant;
 
 /*! @struct SpvReflectShaderModule
