@@ -1820,17 +1820,6 @@ static SpvReflectResult ParseDecorations(SpvReflectPrvParser* p_parser, SpvRefle
 
         p_module->spec_constants[count].name = target_node->name;
 
-        // Set type (from result_type_id)
-        p_module->spec_constants[count].type = FindType(p_module, target_node->result_type_id);
-        if (IsNull(p_module->spec_constants[count].type)) {
-          fprintf(stderr, "Error: No type found for result_type_id %u (SPIR-V ID %u, op %u)\n", target_node->result_type_id,
-                  p_module->spec_constants[count].spirv_id, target_node->op);
-        } else {
-          fprintf(stderr, "Debug: Found type for SPIR-V ID %u, type op %u\n", p_module->spec_constants[count].spirv_id,
-                  p_module->spec_constants[count].type->op);
-        }
-
-        // Parse default value if present (skip OpSpecConstantOp)
         if (target_node->op != SpvOpSpecConstantOp) {
           uint32_t literal_count = 0;
           SpvReflectResult res = ParseSpecializationConstantValue(p_parser, target_node, NULL, &literal_count);
